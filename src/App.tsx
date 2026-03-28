@@ -1,14 +1,14 @@
 import { useState, useRef, useEffect, ChangeEvent } from "react";
 import { GoogleGenAI } from "@google/genai";
 import { motion, AnimatePresence } from "motion/react";
-import { 
-  Mail, 
-  Upload, 
-  Send, 
-  User, 
-  FileText, 
-  Sparkles, 
-  CheckCircle2, 
+import {
+  Mail,
+  Upload,
+  Send,
+  User,
+  FileText,
+  Sparkles,
+  CheckCircle2,
   AlertCircle,
   Loader2,
   Plus,
@@ -16,9 +16,15 @@ import {
   History,
   Trash2,
   FileJson,
-  Copy
+  Copy,
+  Users
 } from "lucide-react";
 import { cn } from "./lib/utils";
+
+interface Recruiter {
+  name: string;
+  email: string;
+}
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -26,7 +32,7 @@ export default function App() {
   const [fromName, setFromName] = useState("Arjun Chaurasiya");
   const [replyTo, setReplyTo] = useState("arjunkmr1997@gmail.com");
   const [subject, setSubject] = useState("Application for Senior QA Engineer Position – Arjun Chaurasiya (6+ Years Experience)");
-  const [body, setBody] = useState(`Hi,
+  const [body, setBody] = useState(`Hi {Name},
 
 I got to know that you are hiring. I am looking for a Senior QA / Test Automation position. Please find my details below:
 
@@ -44,6 +50,8 @@ Thanks & regards,
 Arjun Chaurasiya
 Contact No: +91-7906973405`);
   const [emails, setEmails] = useState("");
+  const [recruiters, setRecruiters] = useState<Recruiter[]>([]);
+  const [isExtractingPDF, setIsExtractingPDF] = useState(false);
   const [resume, setResume] = useState<File | null>(null);
   const [resumeData, setResumeData] = useState<{ name: string; type: string; data: string } | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -57,6 +65,7 @@ Contact No: +91-7906973405`);
   const [error, setError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const recruiterPdfRef = useRef<HTMLInputElement>(null);
 
   // Load remembered resume and history on mount
   useEffect(() => {
@@ -130,6 +139,34 @@ Contact No: +91-7906973405`);
     }
   };
 
+  const handleRecruiterPDF = async (e: ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files?.[0]) return;
+    setIsExtractingPDF(true);
+    setError(null);
+    const formData = new FormData();
+    formData.append("pdf", e.target.files[0]);
+    try {
+      const res = await fetch("/api/extract-recruiters", { method: "POST", body: formData });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Extraction failed");
+      const extracted: Recruiter[] = data.recruiters || [];
+      setRecruiters(extracted);
+      setEmails(extracted.map(r => r.email).join(", "));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to extract recruiters from PDF");
+    } finally {
+      setIsExtractingPDF(false);
+      // Reset input so same file can be re-uploaded
+      if (recruiterPdfRef.current) recruiterPdfRef.current.value = "";
+    }
+  };
+
+  const removeRecruiter = (idx: number) => {
+    const updated = recruiters.filter((_, i) => i !== idx);
+    setRecruiters(updated);
+    setEmails(updated.map(r => r.email).join(", "));
+  };
+
   const generateAIBody = async () => {
     if (!fromName) {
       setError("Please enter your name first.");
@@ -176,7 +213,11 @@ Contact No: +91-7906973405`);
     if (!retryList) setResults(null);
 
     const formData = new FormData();
-    formData.append("emails", targetEmails);
+    if (recruiters.length > 0 && !retryList) {
+      formData.append("recipientsJson", JSON.stringify(recruiters));
+    } else {
+      formData.append("emails", targetEmails);
+    }
     formData.append("subject", subject);
     formData.append("body", body);
     formData.append("fromName", fromName);
@@ -370,22 +411,76 @@ Contact No: +91-7906973405`);
             </section>
 
             <section className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
-              <div className="p-6 border-b border-gray-100 bg-gray-50/50">
+              <div className="p-6 border-b border-gray-100 bg-gray-50/50 flex items-center justify-between">
                 <h2 className="text-lg font-semibold flex items-center gap-2">
-                  <Mail className="w-5 h-5 text-blue-600" />
+                  <Users className="w-5 h-5 text-blue-600" />
                   Recipients
                 </h2>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="file"
+                    ref={recruiterPdfRef}
+                    onChange={handleRecruiterPDF}
+                    accept=".pdf"
+                    className="hidden"
+                  />
+                  <button
+                    onClick={() => recruiterPdfRef.current?.click()}
+                    disabled={isExtractingPDF}
+                    className="flex items-center gap-1.5 text-sm text-blue-600 hover:text-blue-700 font-medium disabled:opacity-50 transition-colors border border-blue-200 px-3 py-1.5 rounded-xl bg-blue-50 hover:bg-blue-100"
+                  >
+                    {isExtractingPDF ? (
+                      <><Loader2 className="w-4 h-4 animate-spin" /> Extracting...</>
+                    ) : (
+                      <><Upload className="w-4 h-4" /> Upload Recruiter PDF</>
+                    )}
+                  </button>
+                </div>
               </div>
-              <div className="p-6">
-                <label className="block text-sm font-medium text-gray-700 mb-1">Email Addresses (comma separated)</label>
-                <textarea 
-                  value={emails}
-                  onChange={(e) => setEmails(e.target.value)}
-                  placeholder="hr@company.com, jobs@startup.io, recruiter@agency.net"
-                  rows={3}
-                  className="w-full px-4 py-3 rounded-xl border border-gray-200 focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all outline-none resize-none"
-                />
-                <p className="mt-2 text-xs text-gray-400">Separate multiple emails with commas.</p>
+              <div className="p-6 space-y-4">
+                {recruiters.length > 0 ? (
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <label className="text-sm font-medium text-gray-700">
+                        Extracted Recruiters ({recruiters.length})
+                      </label>
+                      <button
+                        onClick={() => { setRecruiters([]); setEmails(""); }}
+                        className="text-xs text-red-500 hover:text-red-600 font-medium"
+                      >
+                        Clear All
+                      </button>
+                    </div>
+                    <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+                      {recruiters.map((r, idx) => (
+                        <div key={idx} className="flex items-center justify-between p-2.5 rounded-xl bg-blue-50/50 border border-blue-100">
+                          <div className="min-w-0">
+                            {r.name && <p className="text-sm font-medium text-gray-800 truncate">{r.name}</p>}
+                            <p className="text-xs text-gray-500 truncate">{r.email}</p>
+                          </div>
+                          <button onClick={() => removeRecruiter(idx)} className="text-gray-300 hover:text-red-400 ml-2 shrink-0">
+                            <X className="w-4 h-4" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                    <p className="mt-2 text-xs text-blue-600 font-medium">
+                      ✨ Use <code className="bg-blue-100 px-1 rounded">{"{Name}"}</code> in your email body — it will be replaced with each recruiter's name.
+                    </p>
+                  </div>
+                ) : (
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Email Addresses (comma separated)</label>
+                    <textarea
+                      value={emails}
+                      onChange={(e) => setEmails(e.target.value)}
+                      placeholder="hr@company.com, jobs@startup.io, recruiter@agency.net"
+                      rows={3}
+                      className="w-full px-4 py-3 rounded-xl border border-gray-200 focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all outline-none resize-none"
+                    />
+                    <p className="mt-2 text-xs text-gray-400">Or upload a PDF above to auto-extract recruiter names & emails.</p>
+                  </div>
+                )}
               </div>
             </section>
           </div>

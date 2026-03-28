@@ -6,6 +6,10 @@ import multer from "multer";
 import nodemailer from "nodemailer";
 import dotenv from "dotenv";
 import fs from "fs";
+import { createRequire } from "module";
+const require = createRequire(import.meta.url);
+const pdfParse = require("pdf-parse");
+import { GoogleGenAI } from "@google/genai";
 
 dotenv.config();
 
@@ -54,6 +58,7 @@ interface EmailTask {
   body: string;
   fromName: string;
   replyTo?: string;
+  recipientName?: string;
   resume?: {
     originalname: string;
     buffer: Buffer;
@@ -146,11 +151,14 @@ class MessageBroker {
 
       try {
         if (gmailTransporter) {
+          const personalizedBody = task.recipientName
+            ? task.body.replace(/\{Name\}/g, task.recipientName)
+            : task.body.replace(/\{Name\}/g, "");
           await gmailTransporter.sendMail({
             from: `"${task.fromName || "Job Applicant"}" <${process.env.GMAIL_USER}>`,
             to: task.to,
             subject: task.subject,
-            text: task.body,
+            text: personalizedBody,
             replyTo: task.replyTo || undefined,
             headers: {
               "X-JobApply-AI": "SentViaApp",
@@ -205,7 +213,7 @@ const broker = new MessageBroker();
 async function startServer() {
   console.log("Starting server...");
   const app = express();
-  const PORT = process.env.PORT || 3000;
+  const PORT = 3000;
 
   // Configure multer for memory storage
   const storage = multer.memoryStorage();
@@ -247,21 +255,133 @@ async function startServer() {
     res.json({ status: "ok" });
   });
 
+  // Generic/role-based email local parts that are not personal names
+  const GENERIC_LOCAL_PARTS = new Set([
+    "careers", "career", "hr", "jobs", "job", "info", "recruit", "recruiting",
+    "recruiter", "hiring", "talent", "apply", "applications", "application",
+    "contact", "hello", "team", "staff", "people", "work", "employment",
+    "resumes", "resume", "cvs", "cv", "opportunity", "opportunities", "hello",
+  ]);
+
+  function deriveNameFromEmail(email: string): string {
+    const [localPart, domain] = email.split("@");
+    const localWords = localPart
+      .replace(/[._\-]+/g, " ")
+      .replace(/\d+/g, "")
+      .trim()
+      .split(" ")
+      .filter(w => w.length > 1);
+
+    // If local part looks like a real name (2+ parts, none are generic), use it
+    if (
+      localWords.length >= 2 &&
+      localWords.every(w => !GENERIC_LOCAL_PARTS.has(w.toLowerCase()))
+    ) {
+      return localWords.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
+    }
+
+    // If single word and not generic, still use it as a name
+    if (
+      localWords.length === 1 &&
+      !GENERIC_LOCAL_PARTS.has(localWords[0].toLowerCase())
+    ) {
+      const w = localWords[0];
+      return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+    }
+
+    // Fallback: extract company name from domain (e.g. sybroxtech.com → Sybroxtech)
+    const company = domain.split(".")[0];
+    const companyName = company.charAt(0).toUpperCase() + company.slice(1).toLowerCase();
+    return `${companyName} Recruiter`;
+  }
+
+  // Regex-based fallback: extract emails and derive names from the email itself
+  function extractRecruitersFromText(text: string): { name: string; email: string }[] {
+    const emailRegex = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+    const seen = new Set<string>();
+    const results: { name: string; email: string }[] = [];
+    let match;
+    while ((match = emailRegex.exec(text)) !== null) {
+      const email = match[0];
+      if (seen.has(email)) continue;
+      seen.add(email);
+      results.push({ email, name: deriveNameFromEmail(email) });
+    }
+    return results;
+  }
+
+  app.post("/api/extract-recruiters", upload.single("pdf"), async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: "No PDF uploaded" });
+    try {
+      const pdfData = await pdfParse(req.file.buffer);
+      const text = pdfData.text;
+
+      // Try Gemini AI first, fall back to regex if quota exceeded or unavailable
+      if (process.env.GEMINI_API_KEY) {
+        try {
+          const genai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+          const response = await genai.
+          
+          
+          models.generateContent({
+            model: "gemini-2.0-flash",
+            contents: `Extract all recruiter/contact names and email addresses from the text below.
+Return ONLY a valid JSON array in this format: [{"name": "Full Name", "email": "email@example.com"}]
+If no name is found for an email, use an empty string for name.
+Do not include any explanation, just the JSON array.
+
+Text:
+${text}`,
+          });
+
+          const raw = response.text || "";
+          const jsonMatch = raw.match(/\[[\s\S]*\]/);
+          if (jsonMatch) {
+            const recruiters = JSON.parse(jsonMatch[0]).map((r: any) => ({
+              ...r,
+              name: deriveNameFromEmail(r.email),
+            }));
+            return res.json({ recruiters, source: "ai" });
+          }
+        } catch (aiErr: any) {
+          const is429 = aiErr?.status === 429 || String(aiErr).includes("429") || String(aiErr).includes("RESOURCE_EXHAUSTED");
+          if (!is429) throw aiErr;
+          console.warn("Gemini quota exceeded, falling back to regex extraction.");
+        }
+      }
+
+      // Regex fallback
+      const recruiters = extractRecruitersFromText(text);
+      if (recruiters.length === 0) return res.status(422).json({ error: "No email addresses found in PDF" });
+      res.json({ recruiters, source: "regex" });
+
+    } catch (err) {
+      console.error("PDF extraction error:", err);
+      res.status(500).json({ error: "Failed to parse PDF" });
+    }
+  });
+
   app.post("/api/send-emails", upload.single("resume"), async (req, res) => {
     console.log("Received request to /api/send-emails");
     try {
-      const { emails, subject, body, fromName, replyTo } = req.body;
+      const { emails, subject, body, fromName, replyTo, recipientsJson } = req.body;
       const resume = req.file;
 
       if (!gmailTransporter) {
-        return res.status(500).json({ 
-          error: "No email service configured. Please add GMAIL_USER and GMAIL_APP_PASSWORD to your environment variables." 
+        return res.status(500).json({
+          error: "No email service configured. Please add GMAIL_USER and GMAIL_APP_PASSWORD to your environment variables."
         });
       }
 
-      const emailList = emails.split(",").map((e: string) => e.trim()).filter(Boolean);
+      // Support both personalized recipients (from PDF) and plain email list
+      let recipientList: { email: string; name?: string }[] = [];
+      if (recipientsJson) {
+        recipientList = JSON.parse(recipientsJson).filter((r: any) => r.email?.trim());
+      } else {
+        recipientList = emails.split(",").map((e: string) => ({ email: e.trim() })).filter((r: any) => r.email);
+      }
 
-      if (emailList.length === 0) {
+      if (recipientList.length === 0) {
         return res.status(400).json({ error: "No valid email addresses provided" });
       }
 
@@ -269,21 +389,22 @@ async function startServer() {
       jobs[jobId] = {
         status: "pending",
         results: [],
-        total: emailList.length,
+        total: recipientList.length,
         processed: 0
       };
 
       const taggedBody = `${body}\n\n---\nSent via JobApply AI`;
 
       // Push tasks to broker
-      for (const to of emailList) {
+      for (const recipient of recipientList) {
         broker.push({
           jobId,
-          to,
+          to: recipient.email,
           subject,
           body: taggedBody,
           fromName,
           replyTo,
+          recipientName: recipient.name || undefined,
           resume: resume ? {
             originalname: resume.originalname,
             buffer: resume.buffer
