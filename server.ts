@@ -59,14 +59,21 @@ interface EmailTask {
   fromName: string;
   replyTo?: string;
   recipientName?: string;
-  resume?: {
-    originalname: string;
-    buffer: Buffer;
-  };
+}
+
+interface JobResume {
+  originalname: string;
+  buffer: Buffer;
 }
 
 class MessageBroker {
   private queue: EmailTask[] = [];
+  // Resume is stored once per job, not duplicated on every task -
+  // duplicating it per-task previously bloated the persisted queue file
+  // (500 recipients x ~200KB resume = ~99MB) and made every disk write
+  // during sending block the event loop long enough that stop requests
+  // never got a chance to run.
+  private jobResumes: Record<string, JobResume> = {};
   private isProcessing = false;
   private queueFilePath = path.join(process.cwd(), "email_queue.json");
 
@@ -79,16 +86,37 @@ class MessageBroker {
       if (fs.existsSync(this.queueFilePath)) {
         const data = fs.readFileSync(this.queueFilePath, "utf8");
         const parsed = JSON.parse(data);
-        // Convert base64 back to Buffer for resume attachments
-        this.queue = parsed.map((task: any) => ({
-          ...task,
-          resume: task.resume ? {
-            ...task.resume,
-            buffer: Buffer.from(task.resume.buffer, "base64")
-          } : undefined
-        }));
+
+        if (Array.isArray(parsed)) {
+          // Legacy format: flat array of tasks, each carrying its own resume buffer.
+          // Migrate to the compact per-job format.
+          for (const task of parsed) {
+            if (task.resume && !this.jobResumes[task.jobId]) {
+              this.jobResumes[task.jobId] = {
+                originalname: task.resume.originalname,
+                buffer: Buffer.from(task.resume.buffer, "base64"),
+              };
+            }
+            this.queue.push({
+              jobId: task.jobId,
+              to: task.to,
+              subject: task.subject,
+              body: task.body,
+              fromName: task.fromName,
+              replyTo: task.replyTo,
+              recipientName: task.recipientName,
+            });
+          }
+        } else {
+          this.queue = parsed.tasks || [];
+          for (const [jobId, r] of Object.entries(parsed.resumes || {}) as [string, any][]) {
+            this.jobResumes[jobId] = { originalname: r.originalname, buffer: Buffer.from(r.buffer, "base64") };
+          }
+        }
+
         console.log(`Loaded ${this.queue.length} tasks from persistent queue.`);
         if (this.queue.length > 0) {
+          this.saveQueue(); // rewrite immediately in the compact format
           this.process();
         }
       }
@@ -99,28 +127,29 @@ class MessageBroker {
 
   private saveQueue() {
     try {
-      // Convert Buffer to base64 for JSON serialization
-      const dataToSave = this.queue.map(task => ({
-        ...task,
-        resume: task.resume ? {
-          ...task.resume,
-          buffer: task.resume.buffer.toString("base64")
-        } : undefined
-      }));
-      fs.writeFileSync(this.queueFilePath, JSON.stringify(dataToSave, null, 2));
+      const resumes: Record<string, { originalname: string; buffer: string }> = {};
+      for (const [jobId, r] of Object.entries(this.jobResumes)) {
+        if (this.queue.some(t => t.jobId === jobId)) {
+          resumes[jobId] = { originalname: r.originalname, buffer: r.buffer.toString("base64") };
+        }
+      }
+      fs.writeFileSync(this.queueFilePath, JSON.stringify({ tasks: this.queue, resumes }));
     } catch (err) {
       console.error("Failed to save queue to file:", err);
     }
   }
 
-  push(task: EmailTask) {
-    this.queue.push(task);
+  pushBatch(tasks: EmailTask[], resume?: JobResume) {
+    if (tasks.length === 0) return;
+    if (resume) this.jobResumes[tasks[0].jobId] = resume;
+    this.queue.push(...tasks);
     this.saveQueue();
     this.process();
   }
 
   cancelJob(jobId: string) {
     this.queue = this.queue.filter(t => t.jobId !== jobId);
+    delete this.jobResumes[jobId];
     this.saveQueue();
   }
 
@@ -151,6 +180,7 @@ class MessageBroker {
 
       try {
         if (gmailTransporter) {
+          const resume = this.jobResumes[task.jobId];
           const personalizedBody = task.recipientName
             ? task.body.replace(/\{Name\}/g, task.recipientName)
             : task.body.replace(/\{Name\}/g, "");
@@ -164,10 +194,10 @@ class MessageBroker {
               "X-JobApply-AI": "SentViaApp",
               "X-Category": "Job-Application"
             },
-            attachments: task.resume ? [
+            attachments: resume ? [
               {
-                filename: task.resume.originalname,
-                content: task.resume.buffer,
+                filename: resume.originalname,
+                content: resume.buffer,
               }
             ] : [],
           });
@@ -195,6 +225,7 @@ class MessageBroker {
         currentJob.processed++;
         if (currentJob.processed >= currentJob.total && (currentJob.status as string) !== "failed") {
           currentJob.status = "completed";
+          delete this.jobResumes[task.jobId];
         }
         
         // Respect Gmail throttling
@@ -213,7 +244,7 @@ const broker = new MessageBroker();
 async function startServer() {
   console.log("Starting server...");
   const app = express();
-  const PORT = 3000;
+  const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 
   // Configure multer for memory storage
   const storage = multer.memoryStorage();
@@ -395,22 +426,18 @@ ${text}`,
 
       const taggedBody = `${body}\n\n---\nSent via JobApply AI`;
 
-      // Push tasks to broker
-      for (const recipient of recipientList) {
-        broker.push({
-          jobId,
-          to: recipient.email,
-          subject,
-          body: taggedBody,
-          fromName,
-          replyTo,
-          recipientName: recipient.name || undefined,
-          resume: resume ? {
-            originalname: resume.originalname,
-            buffer: resume.buffer
-          } : undefined
-        });
-      }
+      // Build all tasks in memory and push as a single batch (one disk write),
+      // with the resume stored once per job instead of once per recipient.
+      const tasks = recipientList.map(recipient => ({
+        jobId,
+        to: recipient.email,
+        subject,
+        body: taggedBody,
+        fromName,
+        replyTo,
+        recipientName: recipient.name || undefined,
+      }));
+      broker.pushBatch(tasks, resume ? { originalname: resume.originalname, buffer: resume.buffer } : undefined);
 
       res.json({ jobId });
     } catch (error) {

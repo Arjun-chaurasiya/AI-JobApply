@@ -57,6 +57,7 @@ Contact No: +91-7906973405`);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
+  const [jobStatus, setJobStatus] = useState<"pending" | "processing" | "completed" | "failed" | null>(null);
   const [jobProgress, setJobProgress] = useState<{ processed: number; total: number } | null>(null);
   const [results, setResults] = useState<{ email: string; success: boolean; error?: string }[] | null>(null);
   const [viewMode, setViewMode] = useState<"list" | "plain">("list");
@@ -192,11 +193,15 @@ Contact No: +91-7906973405`);
     }
   };
 
+  const pollJobRef = useRef<(() => void) | null>(null);
+
   const stopJob = async () => {
     if (!currentJobId) return;
     try {
       await fetch(`/api/jobs/${currentJobId}`, { method: "DELETE" });
       setError("Email sending stopped by user.");
+      // Re-check status immediately instead of waiting for the next 2s poll tick.
+      pollJobRef.current?.();
     } catch (err) {
       console.error("Failed to stop job:", err);
     }
@@ -251,14 +256,16 @@ Contact No: +91-7906973405`);
       
       const { jobId } = data;
       setCurrentJobId(jobId);
-      
+      setJobStatus("pending");
+
       // Start polling for job status
       const pollJob = async () => {
         try {
           const jobRes = await fetch(`/api/jobs/${jobId}`);
           if (!jobRes.ok) throw new Error("Failed to fetch job status");
           const jobData = await jobRes.json();
-          
+
+          setJobStatus(jobData.status);
           setJobProgress({ processed: jobData.processed, total: jobData.total });
           setResults(prev => {
             if (retryList) {
@@ -275,9 +282,11 @@ Contact No: +91-7906973405`);
 
           if (jobData.status === "completed" || jobData.status === "failed") {
             setIsSending(false);
+            setJobStatus(null);
             setJobProgress(null);
             setCurrentJobId(null);
-            
+            pollJobRef.current = null;
+
             // Update history only when finished
             const newHistoryItems = jobData.results.map((r: any) => ({
               ...r,
@@ -297,11 +306,14 @@ Contact No: +91-7906973405`);
           console.error("Polling error:", err);
           setError("Lost connection to the email job. Results may be incomplete.");
           setIsSending(false);
+          setJobStatus(null);
           setJobProgress(null);
           setCurrentJobId(null);
+          pollJobRef.current = null;
         }
       };
-      
+
+      pollJobRef.current = pollJob;
       pollJob();
     } catch (err) {
       console.error(err);
@@ -564,16 +576,24 @@ Contact No: +91-7906973405`);
               )}
 
               {isSending && jobProgress && (
-                <div className="w-full bg-gray-100 rounded-full h-2 overflow-hidden">
-                  <motion.div 
-                    initial={{ width: 0 }}
-                    animate={{ width: `${(jobProgress.processed / jobProgress.total) * 100}%` }}
-                    className="bg-blue-600 h-full"
-                  />
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-gray-500">
+                    <span>{jobStatus === "pending" ? `Queuing ${jobProgress.total} email${jobProgress.total === 1 ? "" : "s"}` : "Sending"}</span>
+                    <span>{jobProgress.processed}/{jobProgress.total}</span>
+                  </div>
+                  <div className="w-full bg-gray-100 rounded-full h-2 overflow-hidden">
+                    <motion.div
+                      initial={{ width: 0 }}
+                      animate={{
+                        width: jobStatus === "pending" ? "100%" : `${(jobProgress.processed / jobProgress.total) * 100}%`,
+                      }}
+                      className={cn("h-full", jobStatus === "pending" ? "bg-blue-300 animate-pulse" : "bg-blue-600")}
+                    />
+                  </div>
                 </div>
               )}
 
-              <button 
+              <button
                 onClick={() => sendEmails()}
                 disabled={isSending}
                 className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-2xl shadow-lg shadow-blue-200 flex items-center justify-center gap-2 transition-all active:scale-[0.98] disabled:opacity-70 disabled:cursor-not-allowed"
@@ -581,7 +601,11 @@ Contact No: +91-7906973405`);
                 {isSending ? (
                   <>
                     <Loader2 className="w-5 h-5 animate-spin" />
-                    {jobProgress ? `Sending (${jobProgress.processed}/${jobProgress.total})...` : "Initializing Queue..."}
+                    {!jobProgress
+                      ? "Initializing Queue..."
+                      : jobStatus === "pending"
+                        ? `Queuing ${jobProgress.total} email${jobProgress.total === 1 ? "" : "s"}...`
+                        : `Sending (${jobProgress.processed}/${jobProgress.total})...`}
                   </>
                 ) : (
                   <>
